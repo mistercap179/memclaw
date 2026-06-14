@@ -1,0 +1,32 @@
+# Memclaw - VPS deployment via docker compose.
+#
+# Quick start:
+#   1. cp .env.example .env  &&  edit .env with your tokens
+#   2. set MEMCLAW_PLATFORM in .env to telegram / slack / whatsapp
+#   3. docker compose up -d --build
+#
+# WhatsApp first-run only: pair your phone interactively before going
+# detached - see docs/docker.md.
+
+services:
+  memclaw:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    image: memclaw:latest
+    container_name: memclaw
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # Bind mount keeps MEMORY.md, the SQLite index, images, and bot
+      # sessions on the host so they survive image rebuilds and can be
+      # backed up / git-tracked directly. The entrypoint runs as root,
+      # chowns the directory to the in-container `memclaw` user (uid
+      # 1000), then drops privileges - so no host-side chown needed.
+      - ./data:/home/memclaw/.memclaw
+    # WhatsApp's QR pairing on first run needs a TTY. Telegram/Slack don't,
+    # but keeping these on is harmless and lets `docker compose attach` work.
+    stdin_open: true
+    tty: true
+    # Telegram/Slack/WhatsApp are all outbound - no ports to publish.
