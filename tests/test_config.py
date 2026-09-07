@@ -38,3 +38,34 @@ def test_custom_values(tmp_path: Path):
     assert cfg.consolidation_threshold == 3
     assert cfg.decay_half_life_days == 60
     assert cfg.mmr_lambda == 0.5
+
+
+def test_anthropic_model_and_effort_default_to_empty(tmp_path: Path, monkeypatch):
+    """Empty is the signal to fall back to the backend built-in default."""
+    monkeypatch.delenv("ANTHROPIC_MODEL", raising=False)
+    monkeypatch.delenv("ANTHROPIC_EFFORT", raising=False)
+    cfg = MemclawConfig(memory_dir=tmp_path / "m", openai_api_key="k", anthropic_api_key="k")
+    assert cfg.anthropic_model == ""
+    assert cfg.anthropic_effort == ""
+
+
+def test_anthropic_model_and_effort_read_from_env(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_MODEL", "claude-opus-5")
+    monkeypatch.setenv("ANTHROPIC_EFFORT", "xhigh")
+    cfg = MemclawConfig(memory_dir=tmp_path / "m", openai_api_key="k", anthropic_api_key="k")
+    assert cfg.anthropic_model == "claude-opus-5"
+    assert cfg.anthropic_effort == "xhigh"
+
+
+def test_explicit_anthropic_values_win_over_env(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("ANTHROPIC_MODEL", "from-env")
+    monkeypatch.setenv("ANTHROPIC_EFFORT", "low")
+    cfg = MemclawConfig(
+        memory_dir=tmp_path / "m",
+        openai_api_key="k",
+        anthropic_api_key="k",
+        anthropic_model="claude-sonnet-5",
+        anthropic_effort="high",
+    )
+    assert cfg.anthropic_model == "claude-sonnet-5"
+    assert cfg.anthropic_effort == "high"

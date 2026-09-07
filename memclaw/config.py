@@ -39,6 +39,11 @@ class MemclawConfig:
     # "terminal", "telegram", "slack", or "whatsapp".
     platform: str = ""
 
+    # Claude Agent SDK backend settings. Empty means "use the built-in
+    # default" -- see memclaw.backends.claude.
+    anthropic_model: str = ""
+    anthropic_effort: str = ""
+
     # Cursor SDK backend settings
     cursor_api_key: str = ""
     cursor_model: str = ""
@@ -72,6 +77,10 @@ class MemclawConfig:
             self.agent_backend = os.environ.get("AGENT_BACKEND", "")
         if not self.platform:
             self.platform = os.environ.get("MEMCLAW_PLATFORM", "")
+        if not self.anthropic_model:
+            self.anthropic_model = os.environ.get("ANTHROPIC_MODEL", "")
+        if not self.anthropic_effort:
+            self.anthropic_effort = os.environ.get("ANTHROPIC_EFFORT", "")
         if not self.cursor_api_key:
             self.cursor_api_key = os.environ.get("CURSOR_API_KEY", "")
         if not self.cursor_model:
