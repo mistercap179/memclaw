@@ -72,6 +72,30 @@ def _claude_auth_mode(config: "MemclawConfig") -> str:
     return ""
 
 
+def _resolve_model(config: "MemclawConfig") -> str:
+    """The configured model, or the built-in default when unset."""
+    return (config.anthropic_model or "").strip() or _MODEL
+
+
+def _resolve_effort(config: "MemclawConfig") -> str | None:
+    """The configured effort level, or None to let the model decide.
+
+    None makes the SDK omit the flag entirely, so an unset level costs
+    nothing. Anything the SDK does not recognise is treated as unset:
+    ~/.memclaw/.env is a plain text file, and a typo there should not reach
+    the CLI as an argument it will reject.
+
+    Whether the chosen *model* accepts an effort level is a separate question,
+    settled in the wizard — it stores no level for a model that reports none.
+    """
+    # Local import: anthropic_models imports from this module, so importing it
+    # at module level would be circular. Called once, in __init__.
+    from ..anthropic_models import SDK_EFFORT_LEVELS
+
+    effort = (config.anthropic_effort or "").strip().lower()
+    return effort if effort in SDK_EFFORT_LEVELS else None
+
+
 def _build_env(config: "MemclawConfig") -> dict[str, str]:
     """Build the env dict for the Claude CLI subprocess.
 
@@ -169,6 +193,8 @@ class ClaudeAgentBackend:
     def __init__(self, config: "MemclawConfig") -> None:
         self.config = config
         self._env = _build_env(config)
+        self._model = _resolve_model(config)
+        self._effort = _resolve_effort(config)
         self._mcp_server: Any = None  # built lazily, needs a ToolExecutor
         # Subscription billing → no per-message dollar figure in logs.
         self.bills_per_token = _claude_auth_mode(config) == "api_key"
@@ -417,7 +443,8 @@ class ClaudeAgentBackend:
     ) -> str:
         options = ClaudeAgentOptions(
             env=self._env,
-            model=_MODEL,
+            model=self._model,
+            effort=self._effort,
             system_prompt=system_prompt,
             setting_sources=None,
             disallowed_tools=BUILTIN_TOOLS_DISALLOW,
@@ -452,7 +479,8 @@ class ClaudeAgentBackend:
 
         options = ClaudeAgentOptions(
             env=self._env,
-            model=_MODEL,
+            model=self._model,
+            effort=self._effort,
             system_prompt=system_prompt,
             setting_sources=None,
             mcp_servers={MCP_SERVER_NAME: self._mcp_server},
