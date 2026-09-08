@@ -35,11 +35,16 @@ from .tool_policy import BUILTIN_TOOLS_DISALLOW
 if TYPE_CHECKING:
     from rich.console import Console
 
+    from ..anthropic_models import ModelInfo
     from ..config import MemclawConfig
     from ..tools import ToolExecutor
 
 
 _MODEL = "claude-sonnet-4-6"
+
+# Preselected in the wizard for any model that supports effort at all.
+# Every model that reports effort support accepts this level.
+_DEFAULT_EFFORT = "high"
 
 # Sonnet 4 pricing (per 1M tokens) — only used as a fallback if the SDK
 # doesn't return total_cost_usd for an API-key turn.
@@ -232,7 +237,167 @@ class ClaudeAgentBackend:
             console.print(f"[red]Error:[/red] {label} is required.")
             raise SystemExit(1)
 
-        return {env_key: value}, [drop_key]
+        values = {env_key: value}
+        drop_keys = [drop_key]
+
+        model_values, model_drops = cls._ask_model_and_effort(
+            console, existing,
+            credential_key=env_key, credential=value, memory_dir=memory_dir,
+        )
+        values.update(model_values)
+        drop_keys.extend(model_drops)
+        return values, drop_keys
+
+    @classmethod
+    def _probe_config(
+        cls,
+        *,
+        credential_key: str,
+        credential: str,
+        memory_dir: Path | str | None,
+    ) -> "MemclawConfig":
+        """Build a config carrying only the credential just entered.
+
+        The wizard runs before anything is written to ~/.memclaw/.env, so the
+        answer only exists as a local variable at this point. Whichever
+        credential was *not* chosen is blanked afterwards: __post_init__ fills
+        empty fields from os.environ, and a stale token left in the shell would
+        otherwise decide the auth mode instead of the answer given here.
+        """
+        from ..config import MemclawConfig
+
+        config = MemclawConfig(memory_dir=Path(memory_dir)) if memory_dir else MemclawConfig()
+        if credential_key == "CLAUDE_CODE_OAUTH_TOKEN":
+            config.claude_code_oauth_token = credential
+            config.anthropic_api_key = ""
+        else:
+            config.anthropic_api_key = credential
+            config.claude_code_oauth_token = ""
+        return config
+
+    @classmethod
+    def _ask_model_and_effort(
+        cls,
+        console: "Console",
+        existing: dict[str, str],
+        *,
+        credential_key: str,
+        credential: str,
+        memory_dir: Path | str | None,
+    ) -> tuple[dict[str, str], list[str]]:
+        """Ask which model to run and, if it supports one, which effort level.
+
+        Returns (values_to_save, env_keys_to_drop). The list is fetched from
+        Anthropic rather than hardcoded, so a newly released model shows up
+        here with no code change.
+
+        Every failure path returns empty, which leaves whatever the user
+        already had in place: picking a model is a convenience, and it must
+        never be the reason `memclaw configure` cannot finish.
+        """
+        # Local import: anthropic_models imports _claude_auth_mode from this
+        # module, so importing it at module level would be circular.
+        import asyncio
+
+        from ..anthropic_models import fetch_models
+
+        current_model = existing.get("ANTHROPIC_MODEL", "") or _MODEL
+
+        def _keep_current(reason: str) -> tuple[dict[str, str], list[str]]:
+            console.print(
+                f"[yellow]Could not fetch the model list ({reason}) — "
+                f"keeping [bold]{current_model}[/bold].[/yellow]"
+            )
+            return {}, []
+
+        try:
+            with console.status("[cyan]Fetching available Claude models...[/cyan]"):
+                models = asyncio.run(fetch_models(cls._probe_config(
+                    credential_key=credential_key,
+                    credential=credential,
+                    memory_dir=memory_dir,
+                )))
+        except Exception as exc:
+            return _keep_current(f"{type(exc).__name__}: {exc}")
+
+        if not models:
+            return _keep_current("the API returned none")
+
+        picked = cls._pick_model(console, models, current_model)
+        values = {"ANTHROPIC_MODEL": picked.id}
+
+        if not picked.effort_levels:
+            # This model takes no effort value. Skip the question with no
+            # message, and drop any level left over from a previous choice so
+            # it can't be sent to a model that would reject it.
+            return values, ["ANTHROPIC_EFFORT"]
+
+        values["ANTHROPIC_EFFORT"] = cls._pick_effort(
+            console, picked.effort_levels, existing.get("ANTHROPIC_EFFORT", ""),
+        )
+        return values, []
+
+    @staticmethod
+    def _pick_model(
+        console: "Console", models: list["ModelInfo"], current_model: str,
+    ) -> "ModelInfo":
+        """Show the numbered model picker, preselecting *current_model*."""
+        rows = []
+        default_choice = "1"
+        for i, model in enumerate(models, 1):
+            marker = ""
+            if model.id == current_model:
+                default_choice = str(i)
+                marker = "  [dim](current)[/dim]"
+            rows.append(
+                f"[bold]{i})[/bold] {model.display_name}  "
+                f"[dim]{model.id}[/dim]{marker}"
+            )
+        console.print()
+        console.print(
+            Panel(
+                "\n".join(rows),
+                title="Which Claude model?",
+                border_style="bright_cyan",
+            )
+        )
+        choice = Prompt.ask(
+            "Choose",
+            choices=[str(i) for i in range(1, len(models) + 1)],
+            default=default_choice,
+        )
+        return models[int(choice) - 1]
+
+    @staticmethod
+    def _pick_effort(
+        console: "Console", levels: list[str], current_effort: str,
+    ) -> str:
+        """Show the effort picker for a model that supports one.
+
+        *levels* only ever holds levels this model accepts, so the preselected
+        value falls back to the first one when the model has no `high`.
+        """
+        preferred = current_effort if current_effort in levels else _DEFAULT_EFFORT
+        default_choice = str(levels.index(preferred) + 1) if preferred in levels else "1"
+        rows = "    ".join(
+            f"[bold]{i})[/bold] {level}" for i, level in enumerate(levels, 1)
+        )
+        console.print()
+        console.print(
+            Panel(
+                f"{rows}\n\n"
+                "[dim]How deeply Claude thinks before answering. "
+                "Lower is faster and cheaper.[/dim]",
+                title="Effort level?",
+                border_style="bright_cyan",
+            )
+        )
+        choice = Prompt.ask(
+            "Choose",
+            choices=[str(i) for i in range(1, len(levels) + 1)],
+            default=default_choice,
+        )
+        return levels[int(choice) - 1]
 
     # -- Lifecycle ---------------------------------------------------------
 
