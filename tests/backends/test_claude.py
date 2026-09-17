@@ -5,6 +5,7 @@ import os
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 
 from memclaw.backends import claude as claude_backend
@@ -209,3 +210,197 @@ class TestRunTurn:
         # so the backend should compute the fallback cost.
         assert result.cost_usd is not None
         assert result.cost_usd > 0
+
+
+# ────────────────────────────────────────────────────────────────────
+# Model + effort resolution
+# ────────────────────────────────────────────────────────────────────
+
+class TestResolveModel:
+    def test_falls_back_to_default_when_unset(self, tmp_path: Path):
+        cfg = _make_config(tmp_path, oauth="x")
+        assert claude_backend._resolve_model(cfg) == claude_backend._MODEL
+
+    def test_configured_model_wins(self, tmp_path: Path):
+        cfg = _make_config(tmp_path, oauth="x")
+        cfg.anthropic_model = "claude-opus-5"
+        assert claude_backend._resolve_model(cfg) == "claude-opus-5"
+
+    def test_blank_value_falls_back(self, tmp_path: Path):
+        cfg = _make_config(tmp_path, oauth="x")
+        cfg.anthropic_model = "   "
+        assert claude_backend._resolve_model(cfg) == claude_backend._MODEL
+
+
+class TestResolveEffort:
+    def test_unset_gives_none(self, tmp_path: Path):
+        cfg = _make_config(tmp_path, oauth="x")
+        assert claude_backend._resolve_effort(cfg) is None
+
+    def test_known_level_passes_through(self, tmp_path: Path):
+        cfg = _make_config(tmp_path, oauth="x")
+        cfg.anthropic_effort = "xhigh"
+        assert claude_backend._resolve_effort(cfg) == "xhigh"
+
+    def test_case_and_padding_are_normalised(self, tmp_path: Path):
+        cfg = _make_config(tmp_path, oauth="x")
+        cfg.anthropic_effort = "  HIGH  "
+        assert claude_backend._resolve_effort(cfg) == "high"
+
+    def test_level_the_sdk_does_not_know_is_ignored(self, tmp_path: Path):
+        """A typo in ~/.memclaw/.env must not reach the CLI as an argument."""
+        cfg = _make_config(tmp_path, oauth="x")
+        cfg.anthropic_effort = "ultra"
+        assert claude_backend._resolve_effort(cfg) is None
+
+
+class TestOptionsCarryModelAndEffort:
+    @pytest.mark.asyncio
+    async def test_configured_values_reach_the_sdk(self, tmp_path: Path):
+        cfg = _make_config(tmp_path, oauth="x")
+        cfg.anthropic_model = "claude-opus-5"
+        cfg.anthropic_effort = "max"
+        backend = ClaudeAgentBackend(cfg)
+
+        ctx_factory, _client = _mock_sdk_client("ok")
+        seen = {}
+
+        def _capture(options, *args, **kwargs):
+            seen["options"] = options
+            return ctx_factory()
+
+        with patch("memclaw.backends.claude.ClaudeSDKClient", side_effect=_capture):
+            await backend.run_one_shot(system_prompt="s", user_message="u")
+
+        assert seen["options"].model == "claude-opus-5"
+        assert seen["options"].effort == "max"
+
+    @pytest.mark.asyncio
+    async def test_defaults_reach_the_sdk_when_nothing_configured(self, tmp_path: Path):
+        backend = ClaudeAgentBackend(_make_config(tmp_path, oauth="x"))
+
+        ctx_factory, _client = _mock_sdk_client("ok")
+        seen = {}
+
+        def _capture(options, *args, **kwargs):
+            seen["options"] = options
+            return ctx_factory()
+
+        with patch("memclaw.backends.claude.ClaudeSDKClient", side_effect=_capture):
+            await backend.run_one_shot(system_prompt="s", user_message="u")
+
+        assert seen["options"].model == claude_backend._MODEL
+        assert seen["options"].effort is None
+
+
+# ────────────────────────────────────────────────────────────────────
+# Wizard: model + effort questions
+# ────────────────────────────────────────────────────────────────────
+
+def _model_info(model_id: str, *, effort_levels: list[str] | None = None):
+    from memclaw.anthropic_models import ModelInfo
+
+    return ModelInfo(
+        id=model_id,
+        display_name=model_id,
+        created_at="2026-07-24T00:00:00Z",
+        effort_levels=effort_levels or [],
+    )
+
+
+def _ask(tmp_path: Path, models, *, existing=None, answers=("1",),
+         fetch_error: Exception | None = None):
+    """Run `_ask_model_and_effort` with the fetch and the prompts mocked.
+
+    Returns (values, drop_keys, prompts, console).
+    """
+    console = MagicMock()   # MagicMock covers console.status(...) as a context manager
+
+    fetch = AsyncMock(side_effect=fetch_error) if fetch_error else AsyncMock(
+        return_value=models)
+    prompts: list[dict] = []
+
+    def _prompt(text, **kwargs):
+        prompts.append({"text": text, **kwargs})
+        return answers[len(prompts) - 1]
+
+    with patch("memclaw.anthropic_models.fetch_models", fetch), \
+            patch("memclaw.backends.claude.Prompt.ask", side_effect=_prompt):
+        values, drops = ClaudeAgentBackend._ask_model_and_effort(
+            console, existing or {},
+            credential_key="ANTHROPIC_API_KEY", credential="sk-ant-test",
+            memory_dir=tmp_path / "m",
+        )
+    return values, drops, prompts, console
+
+
+class TestWizardModelQuestion:
+    def test_picked_model_and_effort_are_stored(self, tmp_path: Path):
+        models = [_model_info("claude-opus-5", effort_levels=["low", "high", "max"])]
+        values, drops, prompts, _ = _ask(tmp_path, models, answers=("1", "3"))
+        assert values == {"ANTHROPIC_MODEL": "claude-opus-5", "ANTHROPIC_EFFORT": "max"}
+        assert drops == []
+        assert len(prompts) == 2
+
+    def test_effort_question_is_skipped_without_support(self, tmp_path: Path):
+        """A model reporting no effort level is never asked about one, and any
+        level left over from an earlier choice is dropped."""
+        models = [_model_info("claude-haiku-4-5")]
+        values, drops, prompts, _ = _ask(
+            tmp_path, models, existing={"ANTHROPIC_EFFORT": "high"}, answers=("1",),
+        )
+        assert values == {"ANTHROPIC_MODEL": "claude-haiku-4-5"}
+        assert drops == ["ANTHROPIC_EFFORT"]
+        assert len(prompts) == 1
+
+    def test_effort_defaults_to_high(self, tmp_path: Path):
+        models = [_model_info("claude-opus-5", effort_levels=["low", "medium", "high"])]
+        _, _, prompts, _ = _ask(tmp_path, models, answers=("1", "3"))
+        assert prompts[1]["default"] == "3"
+
+    def test_effort_default_falls_back_when_high_is_unsupported(self, tmp_path: Path):
+        models = [_model_info("claude-opus-5", effort_levels=["low", "medium"])]
+        _, _, prompts, _ = _ask(tmp_path, models, answers=("1", "1"))
+        assert prompts[1]["default"] == "1"
+
+    def test_current_model_is_preselected(self, tmp_path: Path):
+        models = [_model_info("claude-opus-5"), _model_info("claude-sonnet-5")]
+        _, _, prompts, _ = _ask(
+            tmp_path, models,
+            existing={"ANTHROPIC_MODEL": "claude-sonnet-5"}, answers=("2",),
+        )
+        assert prompts[0]["default"] == "2"
+
+    def test_current_effort_is_preselected(self, tmp_path: Path):
+        models = [_model_info("claude-opus-5", effort_levels=["low", "medium", "high"])]
+        _, _, prompts, _ = _ask(
+            tmp_path, models,
+            existing={"ANTHROPIC_EFFORT": "low"}, answers=("1", "1"),
+        )
+        assert prompts[1]["default"] == "1"
+
+
+class TestWizardSurvivesFetchFailure:
+    @pytest.mark.parametrize("error", [
+        httpx.ConnectError("no network"),
+        httpx.ReadTimeout("timed out"),
+        RuntimeError("no Claude credential configured"),
+    ])
+    def test_failure_warns_and_keeps_the_current_value(self, tmp_path: Path, error):
+        values, drops, prompts, console = _ask(tmp_path, [], fetch_error=error)
+        assert values == {}
+        assert drops == []
+        assert prompts == []          # nothing was asked
+        assert _warned(console)
+
+    def test_empty_model_list_warns_and_keeps_the_current_value(self, tmp_path: Path):
+        values, drops, prompts, console = _ask(tmp_path, [])
+        assert (values, drops, prompts) == ({}, [], [])
+        assert _warned(console)
+
+
+def _warned(console) -> bool:
+    """True when the console got exactly one yellow warning line."""
+    printed = [c.args[0] for c in console.print.call_args_list
+               if c.args and isinstance(c.args[0], str)]
+    return sum("[yellow]" in line for line in printed) == 1
